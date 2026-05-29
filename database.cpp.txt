@@ -1,0 +1,965 @@
+/**
+ * Файл: database.cpp
+ * 
+ * Реализация класса для работы с SQLite базой данных
+ * 
+ * Что хранится в БД:
+ * - users: информация о пользователях
+ * - messages: личные сообщения (с поддержкой мягкого удаления)
+ * - groups: групповые чаты
+ * - group_members: участники групп
+ * - group_messages: сообщения в группах
+ * - deleted_group_messages: какие сообщения в группах скрыл пользователь
+ * 
+ * Особенности:
+ * - Мягкое удаление: сообщения не удаляются физически, а помечаются флагами
+ * - Поддержка часового пояса Новосибирска (UTC+7)
+ * - Потокобезопасность: мьютекс защищает все операции с БД
+ * - Постоянное хранение скрытых сообщений групп (не теряется при перезапуске)
+ */
+
+#include "database.h"
+#include <iostream>
+#include <mutex>
+
+using namespace std;
+
+// Глобальный мьютекс для защиты базы данных от одновременного доступа
+// из разных потоков (сервер многопоточный, все потоки используют один экземпляр Database)
+static mutex db_mutex;
+
+// ============================================================================
+// КОНСТРУКТОР И ДЕСТРУКТОР
+// ============================================================================
+
+/**
+ * Конструктор
+ * Просто инициализирует указатель на БД значением nullptr
+ * Реальное открытие БД происходит в init()
+ */
+Database::Database() : db(nullptr) {}
+
+/**
+ * Деструктор
+ * Закрывает соединение с БД, если оно было открыто
+ */
+Database::~Database() {
+    if (db) sqlite3_close(db);
+}
+
+// ============================================================================
+// ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ
+// ============================================================================
+
+/**
+ * Инициализация базы данных
+ * 
+ * Выполняет:
+ * 1. Открывает (или создаёт) файл messenger.db
+ * 2. Создаёт все необходимые таблицы, если их нет
+ * 
+ * Таблицы:
+ * - users: id, username, created_at
+ * - messages: id, from_user, to_user, message, timestamp, 
+ *            deleted_by_from, deleted_by_to, deleted_for_all,
+ *            reply_to_id, forwarded_from
+ * - groups: id, name, owner
+ * - group_members: group_name, username
+ * - group_messages: id, group_name, from_user, message, timestamp,
+ *                  reply_to_id, forwarded_from
+ * - deleted_group_messages: username, msg_id (для скрытых сообщений в группах)
+ * 
+ * @return true при успехе, false при ошибке
+ */
+bool Database::init() {
+    // Блокируем мьютекс на всё время работы с БД
+    lock_guard<mutex> lock(db_mutex);
+    
+    // Открываем базу данных (файл messenger.db в текущей директории)
+    // Если файла нет, SQLite создаст его автоматически
+    if (sqlite3_open("messenger.db", &db) != SQLITE_OK) {
+        cerr << "Database error: " << sqlite3_errmsg(db) << endl;
+        return false;
+    }
+    
+    // ===== ТАБЛИЦА ПОЛЬЗОВАТЕЛЕЙ =====
+    // Хранит всех зарегистрированных пользователей
+    const char* create_users = 
+        "CREATE TABLE IF NOT EXISTS users ("
+        "id INTEGER PRIMARY KEY,"           // Уникальный ID пользователя
+        "username TEXT UNIQUE,"             // Имя пользователя (уникальное)
+        "created_at DATETIME DEFAULT CURRENT_TIMESTAMP);";  // Дата регистрации
+    
+    // ===== ТАБЛИЦА ЛИЧНЫХ СООБЩЕНИЙ =====
+    // Ключевая таблица с поддержкой мягкого удаления
+    // Сообщения не удаляются физически, а помечаются флагами
+    const char* create_messages = 
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "id INTEGER PRIMARY KEY,"                    // Уникальный ID сообщения
+        "from_user TEXT,"                            // Отправитель
+        "to_user TEXT,"                              // Получатель
+        "message TEXT,"                              // Текст сообщения
+        "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,"  // Время отправки
+        "deleted_by_from INTEGER DEFAULT 0,"         // 1 = удалено отправителем
+        "deleted_by_to INTEGER DEFAULT 0,"           // 1 = удалено получателем
+        "deleted_for_all INTEGER DEFAULT 0,"         // 1 = удалено для всех (пока не используется)
+        "reply_to_id INTEGER DEFAULT NULL,"          // ID сообщения, на которое отвечают
+        "forwarded_from TEXT DEFAULT NULL);";        // Оригинальный автор при пересылке
+    
+    // ===== ТАБЛИЦА ГРУПП =====
+    const char* create_groups = 
+        "CREATE TABLE IF NOT EXISTS groups ("
+        "id INTEGER PRIMARY KEY,"
+        "name TEXT UNIQUE,"          // Название группы (уникальное)
+        "owner TEXT);";              // Кто создал группу (владелец)
+    
+    // ===== ТАБЛИЦА УЧАСТНИКОВ ГРУПП =====
+    // Связь многие-ко-многим между пользователями и группами
+    const char* create_group_members = 
+        "CREATE TABLE IF NOT EXISTS group_members ("
+        "group_name TEXT,"           // Название группы
+        "username TEXT,"             // Имя пользователя
+        "PRIMARY KEY(group_name, username));";  // Составной первичный ключ
+    
+    // ===== ТАБЛИЦА ГРУППОВЫХ СООБЩЕНИЙ =====
+    const char* create_group_messages = 
+        "CREATE TABLE IF NOT EXISTS group_messages ("
+        "id INTEGER PRIMARY KEY,"
+        "group_name TEXT,"           // В какой группе написано
+        "from_user TEXT,"            // Кто написал
+        "message TEXT,"              // Текст сообщения
+        "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,"
+        "reply_to_id INTEGER DEFAULT NULL,"   // Ответ на сообщение
+        "forwarded_from TEXT DEFAULT NULL);"; // Переслано от
+    
+    // ===== НОВАЯ ТАБЛИЦА ДЛЯ СКРЫТЫХ СООБЩЕНИЙ В ГРУППАХ =====
+    // Раньше эта информация хранилась в оперативной памяти (hidden_group_msg)
+    // и терялась при перезапуске клиента. Теперь данные сохраняются в БД
+    // и не исчезают между сессиями.
+    const char* create_deleted_group_msg = 
+        "CREATE TABLE IF NOT EXISTS deleted_group_messages ("
+        "username TEXT,"             // Пользователь, который скрыл сообщение
+        "msg_id INTEGER,"            // ID скрытого сообщения
+        "PRIMARY KEY(username, msg_id));";  // Один пользователь не может скрыть одно сообщение дважды
+    
+    char* err = nullptr;
+    
+    // Выполняем все SQL-запросы на создание таблиц
+    if (sqlite3_exec(db, create_users, nullptr, nullptr, &err) != SQLITE_OK) {
+        cerr << "SQL error: " << err << endl;
+        sqlite3_free(err);
+        return false;
+    }
+    
+    if (sqlite3_exec(db, create_messages, nullptr, nullptr, &err) != SQLITE_OK) {
+        cerr << "SQL error: " << err << endl;
+        sqlite3_free(err);
+        return false;
+    }
+    
+    if (sqlite3_exec(db, create_groups, nullptr, nullptr, &err) != SQLITE_OK) {
+        cerr << "SQL error (groups): " << err << endl;
+        sqlite3_free(err);
+        return false;
+    }
+    
+    if (sqlite3_exec(db, create_group_members, nullptr, nullptr, &err) != SQLITE_OK) {
+        cerr << "SQL error (members): " << err << endl;
+        sqlite3_free(err);
+        return false;
+    }
+    
+    if (sqlite3_exec(db, create_group_messages, nullptr, nullptr, &err) != SQLITE_OK) {
+        cerr << "SQL error (group_messages): " << err << endl;
+        sqlite3_free(err);
+        return false;
+    }
+    
+    // Создаём новую таблицу для скрытых сообщений в группах
+    if (sqlite3_exec(db, create_deleted_group_msg, nullptr, nullptr, &err) != SQLITE_OK) {
+        cerr << "SQL error (deleted_group_messages): " << err << endl;
+        sqlite3_free(err);
+        return false;
+    }
+    
+    return true;
+}
+
+// ============================================================================
+// РАБОТА С ПОЛЬЗОВАТЕЛЯМИ
+// ============================================================================
+
+/**
+ * Создание нового пользователя
+ * 
+ * @param username - имя пользователя
+ * @return true при успехе, false при ошибке
+ * 
+ * INSERT OR IGNORE означает: если пользователь с таким именем уже есть,
+ * ничего не делаем и не выдаём ошибку
+ */
+bool Database::createUser(const string& username) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "INSERT OR IGNORE INTO users (username) VALUES (?);";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        cerr << "Prepare user error: " << sqlite3_errmsg(db) << endl;
+        return false;
+    }
+    
+    // Подставляем имя пользователя вместо "?" в запросе
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return success;
+}
+
+/**
+ * Проверка существования пользователя
+ * 
+ * @param username - имя пользователя
+ * @return true если пользователь существует, false если нет
+ */
+bool Database::userExists(const string& username) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "SELECT 1 FROM users WHERE username = ?;";
+    sqlite3_stmt* stmt;
+    bool exists = false;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        // Если запрос вернул хотя бы одну строку, пользователь существует
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            exists = true;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return exists;
+}
+
+// ============================================================================
+// ЛИЧНЫЕ СООБЩЕНИЯ
+// ============================================================================
+
+/**
+ * Сохранение личного сообщения (упрощённая версия)
+ * 
+ * @param from_user - отправитель
+ * @param to_user - получатель
+ * @param message - текст сообщения
+ * @return ID сохранённого сообщения, -1 при ошибке
+ * 
+ * Просто вызывает расширенную версию с пустыми reply_id и fwd_from
+ */
+int Database::saveMessage(const string& from_user, const string& to_user, const string& message) {
+    return saveMessageAdvanced(from_user, to_user, message, 0, "");
+}
+
+/**
+ * Сохранение личного сообщения с расширенными возможностями
+ * 
+ * @param from_user - отправитель
+ * @param to_user - получатель
+ * @param message - текст сообщения
+ * @param reply_id - ID сообщения, на которое отвечают (0 если не ответ)
+ * @param fwd_from - имя автора оригинального сообщения при пересылке (пусто если не пересылка)
+ * @return ID сохранённого сообщения, -1 при ошибке
+ * 
+ * Примеры:
+ * - Обычное сообщение: reply_id=0, fwd_from=""
+ * - Ответ на сообщение №42: reply_id=42, fwd_from=""
+ * - Пересылка сообщения от Bob: reply_id=0, fwd_from="Bob"
+ */
+int Database::saveMessageAdvanced(const string& from_user, const string& to_user, 
+                                   const string& message, int reply_id, 
+                                   const string& fwd_from) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "INSERT INTO messages (from_user, to_user, message, reply_to_id, forwarded_from) "
+                      "VALUES (?, ?, ?, ?, ?);";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        cerr << "Prepare save message error: " << sqlite3_errmsg(db) << endl;
+        return -1;
+    }
+    
+    // Привязываем значения к параметрам запроса
+    sqlite3_bind_text(stmt, 1, from_user.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, to_user.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, message.c_str(), -1, SQLITE_TRANSIENT);
+    
+    // reply_id может быть NULL (если не ответ)
+    if (reply_id > 0) {
+        sqlite3_bind_int(stmt, 4, reply_id);
+    } else {
+        sqlite3_bind_null(stmt, 4);
+    }
+    
+    // forwarded_from может быть NULL (если не пересылка)
+    if (!fwd_from.empty()) {
+        sqlite3_bind_text(stmt, 5, fwd_from.c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, 5);
+    }
+    
+    int result_id = -1;
+    if (sqlite3_step(stmt) == SQLITE_DONE) {
+        // Получаем автоматически сгенерированный ID нового сообщения
+        result_id = (int)sqlite3_last_insert_rowid(db);
+    } else {
+        cerr << "Step save message error: " << sqlite3_errmsg(db) << endl;
+    }
+    
+    sqlite3_finalize(stmt);
+    return result_id;
+}
+
+/**
+ * Получение текста сообщения по его ID
+ * 
+ * @param msg_id - ID сообщения
+ * @param is_group - true для группового сообщения, false для личного
+ * @param reader_user - кто читает (нужно для проверки прав доступа)
+ * @return текст сообщения в формате "автор: текст" или пустая строка
+ * 
+ * Для личных сообщений проверяет, не удалено ли сообщение для читающего пользователя
+ * Для групповых сообщений проверка проще (нет мягкого удаления в группах)
+ */
+string Database::getMessageText(int msg_id, bool is_group, const string& reader_user) {
+    lock_guard<mutex> lock(db_mutex);
+    string result = "";
+    sqlite3_stmt* stmt;
+
+    if (is_group) {
+        // Групповое сообщение - нет флагов удаления
+        const char* sql = "SELECT from_user, message FROM group_messages WHERE id = ?;";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, msg_id);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                string from = (const char*)sqlite3_column_text(stmt, 0);
+                string msg = (const char*)sqlite3_column_text(stmt, 1);
+                result = from + ": " + msg;
+            }
+        }
+        sqlite3_finalize(stmt);
+    } 
+    else {
+        // Личное сообщение - проверяем флаги удаления
+        const char* sql = "SELECT from_user, to_user, message, deleted_by_from, deleted_by_to, deleted_for_all "
+                          "FROM messages WHERE id = ?;";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int(stmt, 1, msg_id);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                string from = (const char*)sqlite3_column_text(stmt, 0);
+                string to = (const char*)sqlite3_column_text(stmt, 1);
+                string msg = (const char*)sqlite3_column_text(stmt, 2);
+                int del_from = sqlite3_column_int(stmt, 3);  // Удалено отправителем?
+                int del_to = sqlite3_column_int(stmt, 4);    // Удалено получателем?
+                int del_all = sqlite3_column_int(stmt, 5);   // Удалено для всех?
+
+                // Определяем, видимо ли сообщение для читающего пользователя
+                bool visible = true;
+                if (del_all == 1) {
+                    visible = false;  // Удалено для всех
+                }
+                else if (!reader_user.empty()) {
+                    if (reader_user == from && del_from == 1) visible = false;  // Удалено отправителем
+                    if (reader_user == to && del_to == 1) visible = false;      // Удалено получателем
+                }
+
+                if (visible) {
+                    result = from + ": " + msg;
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    // Очищаем результат от мета-информации (типа [Ответ на ...] и [Переслано от ...])
+    // Нужно оставить только "автор: текст" для цитирования
+    if (!result.empty()) {
+        size_t colon_pos = result.find(": ");
+        if (colon_pos != string::npos) {
+            string from = result.substr(0, colon_pos);
+            string msg = result.substr(colon_pos + 2);
+            // Удаляем квадратные скобки с мета-информацией в начале сообщения
+            size_t last_bracket = msg.find_last_of(']');
+            if (last_bracket != string::npos && last_bracket + 1 < msg.length()) {
+                msg = msg.substr(last_bracket + 1);
+                size_t first_char = msg.find_first_not_of(" ");
+                if (first_char != string::npos) msg = msg.substr(first_char);
+            }
+            result = from + ": " + msg;
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Получение всей истории переписки между двумя пользователями
+ * 
+ * @param user1 - первый пользователь
+ * @param user2 - второй пользователь
+ * @return вектор строк в формате: "id|дата|время|отправитель|текст|reply_id|fwd_from"
+ * 
+ * Формат даты: ДД.ММ.ГГГГ (например, 16.11.2023)
+ * Формат времени: ЧЧ:ММ (например, 14:30)
+ * 
+ * Учитывает мягкое удаление:
+ * - Сообщения, удалённые отправителем, не видны отправителю
+ * - Сообщения, удалённые получателем, не видны получателю
+ * - Сообщения не показываются никому, если удалены для всех
+ * 
+ * Часовой пояс: Новосибирск (UTC+7)
+ */
+vector<string> Database::getMessages(const string& user1, const string& user2) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    vector<string> messages;
+    
+    // SQL-запрос с учётом мягкого удаления и часового пояса
+    // strftime(... '+7 hours') - прибавляем 7 часов к UTC, получаем Новосибирск
+    const char* sql = "SELECT id, from_user, message, "
+                 "strftime('%d.%m.%Y', timestamp, '+7 hours'), "
+                 "strftime('%H:%M', timestamp, '+7 hours'), "
+                 "reply_to_id, forwarded_from "
+                 "FROM messages WHERE "
+                 "(((from_user = ? AND to_user = ? AND deleted_by_from = 0) OR "
+                 "  (from_user = ? AND to_user = ? AND deleted_by_to = 0))) "
+                 "AND deleted_for_all = 0 "
+                 "ORDER BY timestamp;";  // Сортируем по времени (старые сверху)
+    
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        // Подставляем имена пользователей (4 раза из-за OR в условии)
+        sqlite3_bind_text(stmt, 1, user1.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, user2.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, user2.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, user1.c_str(), -1, SQLITE_TRANSIENT);
+        
+        // Собираем все строки результата в вектор
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            string id = to_string(sqlite3_column_int(stmt, 0));
+            string from = (const char*)sqlite3_column_text(stmt, 1);
+            string msg = (const char*)sqlite3_column_text(stmt, 2);
+            string date = (const char*)sqlite3_column_text(stmt, 3);
+            string time = (const char*)sqlite3_column_text(stmt, 4);
+            // reply_id может быть NULL
+            string r_id = sqlite3_column_text(stmt, 5) ? (const char*)sqlite3_column_text(stmt, 5) : "0";
+            // forwarded_from может быть NULL
+            string f_from = sqlite3_column_text(stmt, 6) ? (const char*)sqlite3_column_text(stmt, 6) : "";
+            
+            // Формат: id|дата|время|отправитель|текст|reply_id|fwd_from
+            messages.push_back(id + "|" + date + "|" + time + "|" + from + "|" + msg + "|" + r_id + "|" + f_from);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return messages;
+}
+
+/**
+ * Очистка истории переписки для конкретного пользователя
+ * 
+ * @param user - пользователь, который очищает историю
+ * @param target - собеседник
+ * @param for_all - true для удаления для всех (пока не поддерживается)
+ * @return true при успехе
+ * 
+ * Принцип мягкого удаления:
+ * - Сообщения от user к target помечаются deleted_by_from = 1
+ * - Сообщения от target к user помечаются deleted_by_to = 1
+ * 
+ * Сами сообщения остаются в БД, но больше не показываются этому пользователю
+ * Другой участник диалога всё ещё видит эти сообщения
+ */
+bool Database::clearHistoryAdvanced(const string& user, const string& target, bool for_all) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    // Пока не поддерживаем удаление для всех
+    if (for_all) return false;
+    
+    // Помечаем сообщения, отправленные пользователем, как удалённые отправителем
+    const char* sql1 = "UPDATE messages SET deleted_by_from = 1 WHERE from_user = ? AND to_user = ?;";
+    // Помечаем сообщения, полученные пользователем, как удалённые получателем
+    const char* sql2 = "UPDATE messages SET deleted_by_to = 1 WHERE from_user = ? AND to_user = ?;";
+    
+    sqlite3_stmt* stmt1;
+    sqlite3_stmt* stmt2;
+    
+    sqlite3_prepare_v2(db, sql1, -1, &stmt1, nullptr);
+    sqlite3_prepare_v2(db, sql2, -1, &stmt2, nullptr);
+    
+    // Обновляем сообщения от user к target
+    sqlite3_bind_text(stmt1, 1, user.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt1, 2, target.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt1);
+    
+    // Обновляем сообщения от target к user
+    sqlite3_bind_text(stmt2, 1, target.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt2, 2, user.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt2);
+    
+    sqlite3_finalize(stmt1);
+    sqlite3_finalize(stmt2);
+    return true;
+}
+
+/**
+ * Удаление одного сообщения для конкретного пользователя (мягкое удаление)
+ * 
+ * @param msg_id - ID сообщения
+ * @param user - пользователь, который удаляет
+ * @param for_all - true для удаления для всех (пока не поддерживается)
+ * @return true при успехе
+ * 
+ * Если пользователь является отправителем, помечаем deleted_by_from = 1
+ * Если пользователь является получателем, помечаем deleted_by_to = 1
+ * 
+ * Сообщение всё ещё видно второму участнику диалога
+ */
+bool Database::deleteMessageAdvanced(int msg_id, const string& user, bool for_all) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    if (for_all) return false;  // Пока не поддерживаем
+    
+    // Сначала проверяем, кому принадлежит сообщение
+    const char* check_sql = "SELECT from_user, to_user, deleted_for_all FROM messages WHERE id = ?;";
+    sqlite3_stmt* stmt;
+    string from_user = "";
+    string to_user = "";
+    int del_all = 0;
+    bool exists = false;
+    
+    if (sqlite3_prepare_v2(db, check_sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, msg_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            exists = true;
+            from_user = (const char*)sqlite3_column_text(stmt, 0);
+            to_user = (const char*)sqlite3_column_text(stmt, 1);
+            del_all = sqlite3_column_int(stmt, 2);
+        }
+    }
+    sqlite3_finalize(stmt);
+    
+    // Если сообщение уже удалено для всех или не найдено
+    if (!exists || del_all == 1) return false;
+    
+    // Удаляем для отправителя или получателя в зависимости от того, кто запросил
+    const char* sql_from = "UPDATE messages SET deleted_by_from = 1 WHERE id = ? AND from_user = ?;";
+    const char* sql_to = "UPDATE messages SET deleted_by_to = 1 WHERE id = ? AND to_user = ?;";
+    sqlite3_stmt* update_stmt;
+    
+    if (user == from_user) {
+        sqlite3_prepare_v2(db, sql_from, -1, &update_stmt, nullptr);
+    } else if (user == to_user) {
+        sqlite3_prepare_v2(db, sql_to, -1, &update_stmt, nullptr);
+    } else {
+        return false;  // Пользователь не связан с этим сообщением
+    }
+    
+    sqlite3_bind_int(update_stmt, 1, msg_id);
+    sqlite3_bind_text(update_stmt, 2, user.c_str(), -1, SQLITE_TRANSIENT);
+    bool success = (sqlite3_step(update_stmt) == SQLITE_DONE);
+    sqlite3_finalize(update_stmt);
+    return success;
+}
+
+/**
+ * Проверка, были ли сегодня сообщения в диалоге
+ * 
+ * @param user1 - первый пользователь
+ * @param user2 - второй пользователь
+ * @return true если есть хотя бы одно сообщение от сегодняшнего дня
+ * 
+ * Используется для отрисовки разделителя "----- дата -----"
+ * Разделитель показывается только при первом сообщении за день
+ */
+bool Database::hasMessagesToday(const string& user1, const string& user2) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "SELECT 1 FROM messages WHERE "
+                 "((from_user = ? AND to_user = ? AND deleted_by_from = 0) OR "
+                 " (from_user = ? AND to_user = ? AND deleted_by_to = 0)) AND "
+                 "deleted_for_all = 0 AND "
+                 "date(timestamp, '+7 hours') = date('now', '+7 hours') LIMIT 1;";
+    
+    sqlite3_stmt* stmt;
+    bool has_msg = false;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, user1.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, user2.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, user2.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, user1.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            has_msg = true;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return has_msg;
+}
+
+// ============================================================================
+// ГРУППОВЫЕ ЧАТЫ
+// ============================================================================
+
+/**
+ * Проверка существования группы
+ * 
+ * @param group_name - название группы
+ * @return true если группа существует
+ */
+bool Database::groupExists(const string& group_name) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "SELECT 1 FROM groups WHERE name = ?;";
+    sqlite3_stmt* stmt;
+    bool exists = false;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) exists = true;
+    }
+    sqlite3_finalize(stmt);
+    return exists;
+}
+
+/**
+ * Создание новой группы
+ * 
+ * @param group_name - название группы
+ * @param owner - создатель группы (становится владельцем)
+ * @return true при успехе
+ * 
+ * Создатель автоматически добавляется в участники группы
+ */
+bool Database::createGroup(const string& group_name, const string& owner) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    // Создаём запись о группе
+    const char* sql = "INSERT INTO groups (name, owner) VALUES (?, ?);";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, owner.c_str(), -1, SQLITE_TRANSIENT);
+    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    
+    // Если группа создана, добавляем создателя как участника
+    if (success) {
+        const char* sql2 = "INSERT OR IGNORE INTO group_members (group_name, username) VALUES (?, ?);";
+        sqlite3_stmt* stmt2;
+        sqlite3_prepare_v2(db, sql2, -1, &stmt2, nullptr);
+        sqlite3_bind_text(stmt2, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt2, 2, owner.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt2);
+        sqlite3_finalize(stmt2);
+    }
+    return success;
+}
+
+/**
+ * Проверка, является ли пользователь владельцем группы
+ * 
+ * @param group_name - название группы
+ * @param user - имя пользователя
+ * @return true если пользователь - владелец
+ * 
+ * Владелец может:
+ * - Добавлять участников (/gadd)
+ * - Исключать участников (/gkick)
+ */
+bool Database::isGroupOwner(const string& group_name, const string& user) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "SELECT 1 FROM groups WHERE name = ? AND owner = ?;";
+    sqlite3_stmt* stmt;
+    bool is_owner = false;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, user.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) is_owner = true;
+    }
+    sqlite3_finalize(stmt);
+    return is_owner;
+}
+
+/**
+ * Добавление пользователя в группу
+ * 
+ * @param group_name - название группы
+ * @param user - имя пользователя
+ * @return true при успехе
+ * 
+ * INSERT OR IGNORE - если пользователь уже в группе, ничего не делаем
+ */
+bool Database::addGroupMember(const string& group_name, const string& user) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "INSERT OR IGNORE INTO group_members (group_name, username) VALUES (?, ?);";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, user.c_str(), -1, SQLITE_TRANSIENT);
+    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return success;
+}
+
+/**
+ * Удаление пользователя из группы
+ * 
+ * @param group_name - название группы
+ * @param user - имя пользователя
+ * @return true при успехе
+ */
+bool Database::removeGroupMember(const string& group_name, const string& user) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "DELETE FROM group_members WHERE group_name = ? AND username = ?;";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, user.c_str(), -1, SQLITE_TRANSIENT);
+    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return success;
+}
+
+/**
+ * Проверка, состоит ли пользователь в группе
+ * 
+ * @param group_name - название группы
+ * @param user - имя пользователя
+ * @return true если пользователь в группе
+ */
+bool Database::isGroupMember(const string& group_name, const string& user) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "SELECT 1 FROM group_members WHERE group_name = ? AND username = ?;";
+    sqlite3_stmt* stmt;
+    bool is_member = false;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, user.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) is_member = true;
+    }
+    sqlite3_finalize(stmt);
+    return is_member;
+}
+
+/**
+ * Получение списка всех участников группы
+ * 
+ * @param group_name - название группы
+ * @return вектор имён пользователей
+ */
+vector<string> Database::getGroupMembers(const string& group_name) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    vector<string> members;
+    const char* sql = "SELECT username FROM group_members WHERE group_name = ?;";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            members.push_back((const char*)sqlite3_column_text(stmt, 0));
+        }
+    }
+    sqlite3_finalize(stmt);
+    return members;
+}
+
+/**
+ * Получение списка всех групп пользователя
+ * 
+ * @param user - имя пользователя
+ * @return вектор названий групп
+ */
+vector<string> Database::getUserGroups(const string& user) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    vector<string> groups;
+    const char* sql = "SELECT group_name FROM group_members WHERE username = ?;";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, user.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            groups.push_back((const char*)sqlite3_column_text(stmt, 0));
+        }
+    }
+    sqlite3_finalize(stmt);
+    return groups;
+}
+
+// ============================================================================
+// ГРУППОВЫЕ СООБЩЕНИЯ
+// ============================================================================
+
+/**
+ * Сохранение сообщения в групповом чате с расширенными возможностями
+ * 
+ * @param group_name - название группы
+ * @param from_user - отправитель
+ * @param message - текст сообщения
+ * @param reply_id - ID сообщения, на которое отвечают (0 если не ответ)
+ * @param fwd_from - имя автора при пересылке (пусто если не пересылка)
+ * @return ID сохранённого сообщения, -1 при ошибке
+ * 
+ * В групповых чатах нет мягкого удаления (сообщения физически не удаляются)
+ * Пользователи могут только скрыть сообщение локально (через deleted_group_messages)
+ */
+int Database::saveGroupMessageAdvanced(const string& group_name, const string& from_user,
+                                        const string& message, int reply_id, 
+                                        const string& fwd_from) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    const char* sql = "INSERT INTO group_messages (group_name, from_user, message, reply_to_id, forwarded_from) "
+                      "VALUES (?, ?, ?, ?, ?);";
+    sqlite3_stmt* stmt;
+    
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return -1;
+    }
+    
+    sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, from_user.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, message.c_str(), -1, SQLITE_TRANSIENT);
+    
+    if (reply_id > 0) sqlite3_bind_int(stmt, 4, reply_id);
+    else sqlite3_bind_null(stmt, 4);
+    
+    if (!fwd_from.empty()) sqlite3_bind_text(stmt, 5, fwd_from.c_str(), -1, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, 5);
+    
+    int result_id = -1;
+    if (sqlite3_step(stmt) == SQLITE_DONE) {
+        result_id = (int)sqlite3_last_insert_rowid(db);
+    }
+    sqlite3_finalize(stmt);
+    return result_id;
+}
+
+/**
+ * Получение всех сообщений из группового чата
+ * 
+ * @param group_name - название группы
+ * @return вектор строк в формате: "id|дата|время|отправитель|текст|reply_id|fwd_from"
+ * 
+ * Формат даты: ДД.ММ.ГГГГ
+ * Формат времени: ЧЧ:ММ
+ * Часовой пояс: Новосибирск (UTC+7)
+ * 
+ * В групповых чатах сообщения не удаляются физически,
+ * поэтому нет условий про deleted_by_*
+ */
+vector<string> Database::getGroupMessages(const string& group_name) {
+    lock_guard<mutex> lock(db_mutex);
+    
+    vector<string> messages;
+    const char* sql = "SELECT id, from_user, message, "
+                 "strftime('%d.%m.%Y', timestamp, '+7 hours'), "
+                 "strftime('%H:%M', timestamp, '+7 hours'), "
+                 "reply_to_id, forwarded_from "
+                 "FROM group_messages WHERE group_name = ? ORDER BY timestamp;";
+    
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, group_name.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            string id = to_string(sqlite3_column_int(stmt, 0));
+            string from = (const char*)sqlite3_column_text(stmt, 1);
+            string msg = (const char*)sqlite3_column_text(stmt, 2);
+            string date = (const char*)sqlite3_column_text(stmt, 3);
+            string time = (const char*)sqlite3_column_text(stmt, 4);
+            string r_id = sqlite3_column_text(stmt, 5) ? (const char*)sqlite3_column_text(stmt, 5) : "0";
+            string f_from = sqlite3_column_text(stmt, 6) ? (const char*)sqlite3_column_text(stmt, 6) : "";
+            
+            messages.push_back(id + "|" + date + "|" + time + "|" + from + "|" + msg + "|" + r_id + "|" + f_from);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return messages;
+}
+
+/**
+ * Удаление сообщения из группы (заглушка)
+ * 
+ * В текущей версии групповые сообщения не удаляются физически
+ * Пользователи могут только скрыть сообщение локально через deleted_group_messages
+ * 
+ * @return всегда false (не реализовано)
+ * TODO: Возможно, в будущем добавим физическое удаление сообщений для всех участников
+ */
+bool Database::deleteGroupMessage(int msg_id, const string& user, bool for_all) {
+    return false;  // Пока не реализовано
+}
+
+// ============================================================================
+// НОВЫЕ МЕТОДЫ ДЛЯ ГРУППОВЫХ ЧАТОВ (ПОСТОЯННОЕ ХРАНЕНИЕ В БД)
+// ============================================================================
+
+/**
+ * Сохраняет в БД информацию о том, что пользователь скрыл сообщение в группе
+ * 
+ * @param username - имя пользователя
+ * @param msg_id - ID сообщения, которое нужно скрыть
+ * @return true при успехе, false при ошибке
+ * 
+ * ПОЧЕМУ ЭТО ВАЖНО:
+ * Раньше список скрытых сообщений хранился в оперативной памяти (map hidden_group_msg)
+ * и при перезапуске клиента вся информация терялась. Теперь данные сохраняются
+ * в таблице deleted_group_messages и не исчезают между сессиями.
+ * 
+ * INSERT OR IGNORE - если пользователь уже скрыл это сообщение, повторно не добавляем
+ */
+bool Database::hideGroupMessageForUser(const string& username, int msg_id) {
+    lock_guard<mutex> lock(db_mutex);
+    const char* sql = "INSERT OR IGNORE INTO deleted_group_messages (username, msg_id) VALUES (?, ?);";
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, msg_id);
+    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return success;
+}
+
+/**
+ * Загружает из БД список ID сообщений, скрытых пользователем в группах
+ * 
+ * @param username - имя пользователя
+ * @return вектор ID скрытых сообщений
+ * 
+ * Вызывается при каждом входе пользователя в групповой чат.
+ * Благодаря этому пользователь не видит сообщения, которые он скрыл
+ * в прошлые сессии.
+ */
+vector<int> Database::getHiddenGroupMessages(const string& username) {
+    lock_guard<mutex> lock(db_mutex);
+    vector<int> hidden_ids;
+    const char* sql = "SELECT msg_id FROM deleted_group_messages WHERE username = ?;";
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            hidden_ids.push_back(sqlite3_column_int(stmt, 0));
+        }
+    }
+    sqlite3_finalize(stmt);
+    return hidden_ids;
+}
